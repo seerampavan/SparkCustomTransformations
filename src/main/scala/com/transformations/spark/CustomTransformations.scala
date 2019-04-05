@@ -1,8 +1,10 @@
 package com.transformations.spark
 
 import java.io._
+import java.nio.file._
+import java.net.URL
 import java.util.concurrent.atomic.AtomicReference
-import com.twitter.util.Eval
+import java.util.jar.JarInputStream
 import org.apache.spark.SparkConf
 import org.apache.spark.sql._
 import scala.tools.nsc._
@@ -33,13 +35,13 @@ class CustomTransformationsEval(sparkConfOpt: Option[SparkConf] = None,
   private var output = new StringWriter
   private val out: JPrintWriter = new java.io.PrintWriter(output)
 
-  // read the string class object of com.transformations.spark.CustomTransformations and convert to actual object
-  private val eval = new Eval
-  private def decodeCustomTransform(
-      transformationCode: String): CustomTransformations =
-    eval[CustomTransformations](transformationCode)
-
   private val intp = getInterpreter
+
+  private def decodeObject(interpretCode: String): AnyRef = {
+    // interpreting and compiling the raw code
+    intp.interpret(interpretCode)
+    intp.eval(interpretCode)
+  }
 
   /**
     * parse the UDF code and return UDF function and UDF name
@@ -49,8 +51,7 @@ class CustomTransformationsEval(sparkConfOpt: Option[SparkConf] = None,
   private def decodeUDF(udfCode: String): (AnyRef, String) =
     ExceptionHandler {
       // interpreting and compiling the raw UDF code
-      intp.interpret(udfCode)
-      val udfFunction = intp.eval(udfCode)
+      val udfFunction = decodeObject(udfCode)
 
       // capturing the last line from the StringWriter to get the above evaluated string function
       val outputStr = output.toString.substring(0, output.toString.length - 1)
@@ -108,23 +109,58 @@ class CustomTransformationsEval(sparkConfOpt: Option[SparkConf] = None,
       allFiles.filter(_.nonEmpty)
     }
 
-    val cl = ClassLoader.getSystemClassLoader
-    val settings = new GenericRunnerSettings(println _)
+    val classPathJar = sys.props("java.class.path")
+    val rootJarPath =
+      classPathJar.substring(classPathJar.lastIndexOf(File.pathSeparator) + 1)
 
-    if (sparkConfOpt.nonEmpty || additionalJarsRefPaths.nonEmpty) {
-      val jars = (additionalJarsRefPaths ++ getSparkUserJars(sparkConfOpt) ++ cl
-        .asInstanceOf[java.net.URLClassLoader]
-        .getURLs
-        .map(_.toString)).mkString(File.pathSeparator)
-      val interpArguments = List(
-        "-classpath",
-        jars
-      )
-      settings.processArguments(interpArguments, true)
-    }
-    settings.usejavacp.value = true
+    val jarsClassPath =
+      if (rootJarPath.nonEmpty && rootJarPath.contains("classpath")) {
+        val rootJarLocation =
+          rootJarPath.substring(0, rootJarPath.lastIndexOf("/") + 1)
+
+        val jarFileStream = new java.io.FileInputStream(new File(rootJarPath))
+        val jarStream = new JarInputStream(jarFileStream)
+        val mf = jarStream.getManifest
+        jarStream.getManifest.getMainAttributes
+          .getValue(java.util.jar.Attributes.Name.CLASS_PATH)
+          .split(" ")
+          .mkString(rootJarLocation, File.pathSeparator + rootJarLocation, "")
+      } else {
+        def getClasspathUrls(classLoader: ClassLoader,
+                             acc: List[URL]): List[URL] =
+          classLoader match {
+            case null => acc
+            case cl: java.net.URLClassLoader =>
+              getClasspathUrls(classLoader.getParent, acc ++ cl.getURLs.toList)
+            case _ => getClasspathUrls(classLoader.getParent, acc)
+          }
+
+        val classpathUrls =
+          getClasspathUrls(this.getClass.getClassLoader, List())
+        val classpathElements = classpathUrls map (_.toURI.getPath)
+        classpathElements.mkString(File.pathSeparator)
+      }
+
+    val finalJarsClassPath =
+      if (sparkConfOpt.nonEmpty || additionalJarsRefPaths.nonEmpty) {
+        jarsClassPath + ":" +
+          (additionalJarsRefPaths ++ getSparkUserJars(sparkConfOpt))
+            .filter { jarPath =>
+              val fileExists = Files.exists(Paths.get(jarPath))
+              if (!fileExists) println(s"""
+                                    |Unable find the jar at the location $jarPath
+                                    |So ignoring this jar file to put in classpath """.stripMargin)
+              fileExists
+            }
+            .mkString(File.pathSeparator)
+      } else jarsClassPath
+
+    val settings = new Settings()
+
+    settings.classpath append finalJarsClassPath
 
     val intp = new IMain(settings, out)
+    println(intp.global.classPath.asClassPathString)
     intp.setContextClassLoader
     intp.initializeSynchronous
 
@@ -173,8 +209,10 @@ class CustomTransformationsEval(sparkConfOpt: Option[SparkConf] = None,
            |    }
            |}
       """.stripMargin
-      //returning com.transformations.spark.CustomTransformations object along with UDF's list in AnyRef type
-      (decodeCustomTransform(customTransClassStr), udfDetails.map(_._2))
+      // read the string class object of com.transformations.spark.CustomTransformations and convert to actual object
+      // returning com.transformations.spark.CustomTransformations object along with UDF's list in AnyRef type
+      (decodeObject(customTransClassStr).asInstanceOf[CustomTransformations],
+       udfDetails.map(_._2))
     }
 }
 

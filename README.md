@@ -1,5 +1,21 @@
 # Read and execute string scala spark code. 
 
+## Create a deployables
+
+###  Run with JAVA deployables
+    # run the below command to create deployables
+    sbt clean universal:packageBin
+    
+    # deployables will be placed at location target/universal
+    unzip -o target/universal/sparkcustomtransformations-1.0.zip
+    
+    #run the below command from the java deployables
+    target/universal/sparkcustomtransformations-1.0/bin/sparkcustomtransformations
+    
+###  Run on SBT
+    # run the below command to run on SBT
+    sbt run
+
 ## Seperate the UDF code execution from actual spark execution
 
     lazy val spark = getSparkSession
